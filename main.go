@@ -1,259 +1,152 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"os/signal"
-	"regexp"
-	"strings"
-	"sync"
-	"syscall"
 	"time"
-
-	"github.com/PuerkitoBio/goquery"
-	"github.com/chromedp/chromedp"
 )
 
-type ProductData struct {
-	Title       string   `json:"title"`
-	Price       string   `json:"price"`
-	Colors      string   `json:"colors"`
-	Sizes       []string `json:"sizes"`
-	Article     string   `json:"article"`
-	Description string   `json:"description"`
-	Composition string   `json:"composition"`
-	Care        string   `json:"care"`
-	Images      []string `json:"images"`
+// Структура для данных о категории
+type CategoryData struct {
+	Status int `json:"status"`
+	Data struct {
+		Variables struct {
+			SectionId   int    `json:"sectionId"`
+			SectionName string `json:"sectionName"`
+			SectionCode string `json:"sectionCode"`
+		} `json:"variables"`
+	} `json:"data"`
+	Errors   []interface{} `json:"errors"`
+	Messages []interface{} `json:"messages"`
+}
+
+// Структура для данных о товарах
+type ProductsData struct {
+	Status int `json:"status"`
+	Data struct {
+		Pagination struct {
+			Total int `json:"total"`
+			Pages int `json:"pages"`
+		} `json:"pagination"`
+		Items []struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+		} `json:"items"`
+	} `json:"data"`
+	Errors   []interface{} `json:"errors"`
+	Messages []interface{} `json:"messages"`
+}
+
+// Структура для данных о товаре
+type ProductDetails struct {
+	Status int `json:"status"`
+	Data struct {
+		URL string `json:"url"`
+	} `json:"data"`
+	Errors   []interface{} `json:"errors"`
+	Messages []interface{} `json:"messages"`
+}
+
+// Функция для создания JSON запроса
+func toJSON(data map[string]interface{}) (*http.Request, error) {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка при создании JSON данных: %w", err)
+	}
+	req, err := http.NewRequest("POST", "https://loverepublic.ru/api/catalog", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("ошибка при создании HTTP запроса: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return req, nil
 }
 
 func main() {
-	var wg sync.WaitGroup
-	productURLs := make(chan string, 100)
-	productDataChan := make(chan ProductData, 100)
-	products := []ProductData{}
+	categoryURL := "https://loverepublic.ru/catalog/odezhda/" // Замените на нужный URL
 
-	// Запускаем горутины для парсинга товаров
-	for i := 0; i < 10; i++ { // Уменьшаем количество горутин до 10
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for productURL := range productURLs {
-				fmt.Println("Parsing product:", productURL)
-				productData, err := parseProductPage("https://loverepublic.ru" + productURL)
-				if err != nil {
-					log.Printf("error parsing product %s: %v\n", productURL, err)
-					continue
-				}
-				productDataChan <- productData
-			}
-		}()
+	// 1. Получение информации о категории
+	categoryResponse, err := http.Get(fmt.Sprintf("https://loverepublic.ru/api/catalog?url=%s", categoryURL))
+	if err != nil {
+		log.Fatalf("Ошибка при получении информации о категории: %v", err)
+	}
+	defer categoryResponse.Body.Close()
+
+	var categoryData CategoryData
+	if err := json.NewDecoder(categoryResponse.Body).Decode(&categoryData); err != nil {
+		log.Fatalf("Ошибка декодирования JSON для категории: %v", err)
 	}
 
-	// Запускаем горутину для записи данных в JSON
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute) // Периодическая запись каждую минуту
-		defer ticker.Stop()
+	if categoryData.Status != 200 {
+		log.Fatalf("Ошибка API при получении категории: Статус %d, Ошибки: %v, Сообщения: %v", categoryData.Status, categoryData.Errors, categoryData.Messages)
+	}
 
-		for {
-			select {
-			case productData, ok := <-productDataChan:
-				if !ok {
-					// Канал закрыт, завершаем работу
-					saveProducts(products)
-					return
-				}
-				products = append(products, productData)
-			case <-ticker.C:
-				// Периодическая запись данных в файл
-				saveProducts(products)
-			}
+	sectionID := categoryData.Data.Variables.SectionId
+	sectionName := categoryData.Data.Variables.SectionName
+	fmt.Printf("Информация о категории: %s (ID: %d, Код: %s)\n", sectionName, sectionID, categoryData.Data.Variables.SectionCode)
+
+	// 2. Получение информации о товарах
+	client := &http.Client{Timeout: 10 * time.Second}
+	for page := 0; ; page++ {
+		payload := map[string]interface{}{
+			"uri":    fmt.Sprintf("/catalog/sections/%d/products/", sectionID),
+			"city":   "Москва",
+			"order":  "DESC",
+			"sort":   "SORT",
+			"offset": page * 12,
+			"limit":  12,
 		}
-	}()
 
-	// Перебираем все страницы
-	for pageNum := 1; pageNum <= 143; pageNum++ {
-		url := fmt.Sprintf("https://loverepublic.ru/catalog/odezhda/?page=%d", pageNum)
-		fmt.Println("Parsing page:", url)
-		doc, err := fetchDocumentWithRetry(url, 3, 2*time.Second) // Добавляем механизм повторных попыток
+		req, err := toJSON(payload)
 		if err != nil {
-			log.Printf("error parsing page %d: %v\n", pageNum, err)
-			continue
+			log.Fatalf("Ошибка при создании JSON запроса: %v", err)
 		}
 
-		doc.Find(".catalog-item-link").Each(func(i int, s *goquery.Selection) {
-			productURL, exists := s.Attr("href")
-			if exists {
-				productURLs <- productURL
+		productsResponse, err := client.Do(req)
+		if err != nil {
+			log.Fatalf("Ошибка при выполнении запроса к API товаров: %v", err)
+		}
+		defer productsResponse.Body.Close()
+
+		var productsData ProductsData
+		if err := json.NewDecoder(productsResponse.Body).Decode(&productsData); err != nil {
+			log.Fatalf("Ошибка декодирования JSON для товаров: %v", err)
+		}
+
+		if productsData.Status != 200 {
+			log.Fatalf("Ошибка API при получении товаров: Статус %d, Ошибки: %v, Сообщения: %v", productsData.Status, productsData.Errors, productsData.Messages)
+		}
+
+		if len(productsData.Data.Items) == 0 {
+			break // Нет больше товаров на следующих страницах
+		}
+
+		fmt.Printf("Страница %d из %d\n", page+1, productsData.Data.Pagination.Pages)
+
+		for _, item := range productsData.Data.Items {
+			// 3. Получение информации о каждом товаре
+			productResponse, err := client.Get(fmt.Sprintf("https://loverepublic.ru/api/catalog/%d", item.ID))
+			if err != nil {
+				log.Printf("Ошибка при получении информации о товаре %d: %v", item.ID, err)
+				continue
 			}
-		})
-	}
+			defer productResponse.Body.Close()
 
-	close(productURLs)
-	wg.Wait()
-	close(productDataChan)
+			var productDetails ProductDetails
+			if err := json.NewDecoder(productResponse.Body).Decode(&productDetails); err != nil {
+				log.Printf("Ошибка декодирования JSON для товара %d: %v", item.ID, err)
+				continue
+			}
 
-	// Ожидание сигнала остановки
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		fmt.Println("Received interrupt signal, saving data and exiting...")
-		saveProducts(products)
-		os.Exit(0)
-	}()
-}
+			if productDetails.Status != 200 {
+				log.Printf("Ошибка API при получении товара %d: Статус %d, Ошибки: %v, Сообщения: %v", item.ID, productDetails.Status, productDetails.Errors, productDetails.Messages)
+				continue
+			}
 
-func saveProducts(products []ProductData) {
-	filePath := "loverepublic_products.json"
-	fmt.Println("Saving JSON file to:", filePath)
-	file, err := os.Create(filePath)
-	if err != nil {
-		log.Fatalf("error creating JSON file: %v\n", err)
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(products); err != nil {
-		log.Fatalf("error encoding JSON: %v\n", err)
-	}
-
-	log.Println("JSON file saved successfully at", filePath)
-}
-
-func parseProductPage(url string) (ProductData, error) {
-	var html string
-	var err error
-
-	// Повторные попытки для обработки ошибок соединения
-	for attempt := 0; attempt < 3; attempt++ {
-		html, err = fetchHTMLWithChromedp(url)
-		if err == nil {
-			break
+			fmt.Printf("  Товар: %s (ID: %d) - %s\n", item.Name, item.ID, productDetails.Data.URL)
 		}
-		log.Printf("Attempt %d failed: %v. Retrying...", attempt+1, err)
-		time.Sleep(2 * time.Second) // Небольшая задержка перед повторной попыткой
+		time.Sleep(2 * time.Second) // Добавлена задержка для предотвращения перегрузки сервера
 	}
-
-	if err != nil {
-		return ProductData{}, fmt.Errorf("error running chromedp after 3 attempts: %v", err)
-	}
-
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
-	if err != nil {
-		return ProductData{}, fmt.Errorf("error parsing product page HTML: %v", err)
-	}
-
-	title := removeDigits(doc.Find(".catalog-element__title").Text())
-	price := strings.ReplaceAll(doc.Find(".item-prices__price").Text(), " ", "")
-	price = strings.ReplaceAll(price, "\u00A0", "")
-	colors := strings.Join(doc.Find(".catalog-element__color a").Map(func(i int, s *goquery.Selection) string {
-		color, _ := s.Attr("aria-label")
-		return color
-	}), ", ")
-	article := doc.Find(".description-definition").First().Text()
-	description := strings.TrimSpace(strings.TrimPrefix(doc.Find("[data-v-b033c331]").Text(), "Описание: "))
-	composition := doc.Find(".description-definition").Eq(1).Text()
-	care := doc.Find(".description-definition").Eq(2).Text()
-	images := doc.Find(".swiper-slide img").Map(func(i int, s *goquery.Selection) string {
-		imgURL, _ := s.Attr("src")
-		return imgURL
-	})
-
-	// Извлекаем размеры и удаляем дубликаты
-	sizeMap := make(map[string]bool)
-	doc.Find(".sku-select__list li").Each(func(i int, s *goquery.Selection) {
-		size := strings.TrimSpace(s.Text())
-		sizeMap[size] = true
-	})
-	var sizes []string
-	for size := range sizeMap {
-		sizes = append(sizes, size)
-	}
-
-	fmt.Println("Product data extracted")
-	return ProductData{
-		Title:       title,
-		Price:       price,
-		Colors:      colors,
-		Sizes:       sizes,
-		Article:     article,
-		Description: description,
-		Composition: composition,
-		Care:        care,
-		Images:      images,
-	}, nil
-}
-
-func fetchHTMLWithChromedp(url string) (string, error) {
-	ctx, cancel := chromedp.NewExecAllocator(context.Background(),
-		append(chromedp.DefaultExecAllocatorOptions[:],
-			chromedp.Flag("headless", true))...)
-	defer cancel()
-
-	ctx, cancel = chromedp.NewContext(ctx)
-	defer cancel()
-
-	ctx, cancel = context.WithTimeout(ctx, 60*time.Second) // Увеличиваем время ожидания до 60 секунд
-	defer cancel()
-
-	var html string
-	err := chromedp.Run(ctx,
-		chromedp.Navigate(url),
-		chromedp.Sleep(5*time.Second), // Увеличиваем время ожидания загрузки страницы
-		chromedp.OuterHTML(`html`, &html),
-	)
-	if err != nil {
-		return "", fmt.Errorf("error running chromedp: %v", err)
-	}
-
-	return html, nil
-}
-
-func fetchDocumentWithRetry(url string, maxRetries int, delay time.Duration) (*goquery.Document, error) {
-	var doc *goquery.Document
-	var err error
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		doc, err = fetchDocument(url)
-		if err == nil {
-			return doc, nil
-		}
-		log.Printf("Attempt %d failed: %v. Retrying...", attempt+1, err)
-		time.Sleep(delay) // Небольшая задержка перед повторной попыткой
-	}
-
-	return nil, fmt.Errorf("error fetching URL %s after %d attempts: %v", url, maxRetries, err)
-}
-
-func fetchDocument(url string) (*goquery.Document, error) {
-	client := &http.Client{
-		Timeout: 30 * time.Second, // Увеличиваем время ожидания для HTTP-запросов
-	}
-
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("error fetching URL %s: %v", url, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code %d for URL %s", resp.StatusCode, url)
-	}
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing document from URL %s: %v", url, err)
-	}
-
-	return doc, nil
-}
-
-func removeDigits(s string) string {
-	re := regexp.MustCompile(`\d`)
-	return re.ReplaceAllString(s, "")
 }
