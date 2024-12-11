@@ -1,152 +1,165 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"time"
+ "bytes"
+ "encoding/json"
+ "fmt"
+ "log"
+ "net/http"
+ "os"
+ "strconv"
+ "time"
 )
 
 // Структура для данных о категории
 type CategoryData struct {
-	Status int `json:"status"`
-	Data struct {
-		Variables struct {
-			SectionId   int    `json:"sectionId"`
-			SectionName string `json:"sectionName"`
-			SectionCode string `json:"sectionCode"`
-		} `json:"variables"`
-	} `json:"data"`
-	Errors   []interface{} `json:"errors"`
-	Messages []interface{} `json:"messages"`
+ Status int json:"status"
+ Data   struct {
+  Variables struct {
+   SectionID   int    json:"sectionId"
+   SectionName string json:"sectionName"
+  } json:"variables"
+ } json:"data"
 }
 
 // Структура для данных о товарах
 type ProductsData struct {
-	Status int `json:"status"`
-	Data struct {
-		Pagination struct {
-			Total int `json:"total"`
-			Pages int `json:"pages"`
-		} `json:"pagination"`
-		Items []struct {
-			ID   int    `json:"id"`
-			Name string `json:"name"`
-		} `json:"items"`
-	} `json:"data"`
-	Errors   []interface{} `json:"errors"`
-	Messages []interface{} `json:"messages"`
+ Status int json:"status"
+ Data   struct {
+  Pagination struct {
+   Total int json:"total"
+   Pages int json:"pages"
+  } json:"pagination"
+  Items []struct {
+   ID int json:"id"
+  } json:"items"
+ } json:"data"
+}
+
+// Кастомный тип для обработки цены (float64 или string)
+type Price float64
+
+func (p *Price) UnmarshalJSON(b []byte) error {
+ var raw interface{}
+ if err := json.Unmarshal(b, &raw); err != nil {
+  return err
+ }
+ switch v := raw.(type) {
+ case float64:
+  *p = Price(v)
+ case string:
+  parsed, err := strconv.ParseFloat(v, 64)
+  if err != nil {
+   return err
+  }
+  *p = Price(parsed)
+ default:
+  return fmt.Errorf("unexpected type for price: %T", v)
+ }
+ return nil
 }
 
 // Структура для данных о товаре
-type ProductDetails struct {
-	Status int `json:"status"`
-	Data struct {
-		URL string `json:"url"`
-	} `json:"data"`
-	Errors   []interface{} `json:"errors"`
-	Messages []interface{} `json:"messages"`
-}
-
-// Функция для создания JSON запроса
-func toJSON(data map[string]interface{}) (*http.Request, error) {
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка при создании JSON данных: %w", err)
-	}
-	req, err := http.NewRequest("POST", "https://loverepublic.ru/api/catalog", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("ошибка при создании HTTP запроса: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	return req, nil
+type ProductDetail struct {
+ Status int json:"status"
+ Data   struct {
+  ID          int     json:"id"
+  Name        string  json:"name"
+  Price       Price   json:"price"
+  Description string  json:"description"
+ } json:"data"
+ Errors []string json:"errors"
 }
 
 func main() {
-	categoryURL := "https://loverepublic.ru/catalog/odezhda/" // Замените на нужный URL
+ // Пример URL для запросов
+ categoryURL := "https://example.com/categories"
+ productsURL := "https://example.com/products"
+ productDetailURL := "https://example.com/product"
 
-	// 1. Получение информации о категории
-	categoryResponse, err := http.Get(fmt.Sprintf("https://loverepublic.ru/api/catalog?url=%s", categoryURL))
-	if err != nil {
-		log.Fatalf("Ошибка при получении информации о категории: %v", err)
-	}
-	defer categoryResponse.Body.Close()
+ // HTTP клиент с таймаутом
+ client := &http.Client{
+  Timeout: 10 * time.Second,
+ }
 
-	var categoryData CategoryData
-	if err := json.NewDecoder(categoryResponse.Body).Decode(&categoryData); err != nil {
-		log.Fatalf("Ошибка декодирования JSON для категории: %v", err)
-	}
+ // Получение категории
+ category, err := fetchCategory(client, categoryURL)
+ if err != nil {
+  log.Fatalf("Ошибка при получении категории: %v", err)
+ }
+ log.Printf("Категория: %+v", category)
 
-	if categoryData.Status != 200 {
-		log.Fatalf("Ошибка API при получении категории: Статус %d, Ошибки: %v, Сообщения: %v", categoryData.Status, categoryData.Errors, categoryData.Messages)
-	}
+ // Получение товаров
+ products, err := fetchProducts(client, productsURL)
+ if err != nil {
+  log.Fatalf("Ошибка при получении товаров: %v", err)
+ }
+ log.Printf("Найдено товаров: %d", len(products.Data.Items))
 
-	sectionID := categoryData.Data.Variables.SectionId
-	sectionName := categoryData.Data.Variables.SectionName
-	fmt.Printf("Информация о категории: %s (ID: %d, Код: %s)\n", sectionName, sectionID, categoryData.Data.Variables.SectionCode)
+ // Получение деталей по каждому товару
+ for _, item := range products.Data.Items {
+  detail, err := fetchProductDetail(client, fmt.Sprintf("%s/%d", productDetailURL, item.ID))
+  if err != nil {
+   log.Printf("Ошибка при получении товара %d: %v", item.ID, err)
+   continue
+  }
+  log.Printf("Детали товара %d: %+v", item.ID, detail)
+ }
+}
 
-	// 2. Получение информации о товарах
-	client := &http.Client{Timeout: 10 * time.Second}
-	for page := 0; ; page++ {
-		payload := map[string]interface{}{
-			"uri":    fmt.Sprintf("/catalog/sections/%d/products/", sectionID),
-			"city":   "Москва",
-			"order":  "DESC",
-			"sort":   "SORT",
-			"offset": page * 12,
-			"limit":  12,
-		}
+// fetchCategory выполняет запрос категории
+func fetchCategory(client *http.Client, url string) (*CategoryData, error) {
+ resp, err := client.Get(url)
+ if err != nil {
+  return nil, fmt.Errorf("ошибка запроса: %w", err)
+ }
+ defer resp.Body.Close()
 
-		req, err := toJSON(payload)
-		if err != nil {
-			log.Fatalf("Ошибка при создании JSON запроса: %v", err)
-		}
+ if resp.StatusCode != http.StatusOK {
+  return nil, fmt.Errorf("неожиданный статус: %d", resp.StatusCode)
+ }
 
-		productsResponse, err := client.Do(req)
-		if err != nil {
-			log.Fatalf("Ошибка при выполнении запроса к API товаров: %v", err)
-		}
-		defer productsResponse.Body.Close()
+ var data CategoryData
+ if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+  return nil, fmt.Errorf("ошибка декодирования JSON: %w", err)
+ }
+ return &data, nil
+}
 
-		var productsData ProductsData
-		if err := json.NewDecoder(productsResponse.Body).Decode(&productsData); err != nil {
-			log.Fatalf("Ошибка декодирования JSON для товаров: %v", err)
-		}
+// fetchProducts выполняет запрос товаров
+func fetchProducts(client *http.Client, url string) (*ProductsData, error) {
+ resp, err := client.Get(url)
+ if err != nil {
+  return nil, fmt.Errorf("ошибка запроса: %w", err)
+ }
+ defer resp.Body.Close()
 
-		if productsData.Status != 200 {
-			log.Fatalf("Ошибка API при получении товаров: Статус %d, Ошибки: %v, Сообщения: %v", productsData.Status, productsData.Errors, productsData.Messages)
-		}
+ if resp.StatusCode != http.StatusOK {
+  return nil, fmt.Errorf("неожиданный статус: %d", resp.StatusCode)
+ }
 
-		if len(productsData.Data.Items) == 0 {
-			break // Нет больше товаров на следующих страницах
-		}
+ var data ProductsData
+ if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+  return nil, fmt.Errorf("ошибка декодирования JSON: %w", err)
+ }
+ return &data, nil
+}
 
-		fmt.Printf("Страница %d из %d\n", page+1, productsData.Data.Pagination.Pages)
+// fetchProductDetail выполняет запрос деталей товара
+func fetchProductDetail(client *http.Client, url string) (*ProductDetail, error) {
+ resp, err := client.Get(url)
+ if err != nil {
+  return nil, fmt.Errorf("ошибка запроса: %w", err)
+ }
+ defer resp.Body.Close()
 
-		for _, item := range productsData.Data.Items {
-			// 3. Получение информации о каждом товаре
-			productResponse, err := client.Get(fmt.Sprintf("https://loverepublic.ru/api/catalog/%d", item.ID))
-			if err != nil {
-				log.Printf("Ошибка при получении информации о товаре %d: %v", item.ID, err)
-				continue
-			}
-			defer productResponse.Body.Close()
+ if resp.StatusCode != http.StatusOK {
+  return nil, fmt.Errorf("неожиданный статус: %d", resp.StatusCode)
+ }
 
-			var productDetails ProductDetails
-			if err := json.NewDecoder(productResponse.Body).Decode(&productDetails); err != nil {
-				log.Printf("Ошибка декодирования JSON для товара %d: %v", item.ID, err)
-				continue
-			}
-
-			if productDetails.Status != 200 {
-				log.Printf("Ошибка API при получении товара %d: Статус %d, Ошибки: %v, Сообщения: %v", item.ID, productDetails.Status, productDetails.Errors, productDetails.Messages)
-				continue
-			}
-
-			fmt.Printf("  Товар: %s (ID: %d) - %s\n", item.Name, item.ID, productDetails.Data.URL)
-		}
-		time.Sleep(2 * time.Second) // Добавлена задержка для предотвращения перегрузки сервера
-	}
+ var data ProductDetail
+ if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+  return nil, fmt.Errorf("ошибка декодирования JSON: %w", err)
+ }
+ return &data, nil
 }
