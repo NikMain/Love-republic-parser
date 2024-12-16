@@ -1,318 +1,262 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"net/url"
-	"strconv"
-	"sync"
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "time"
+    "os"
+    "strings"
+    "html"
+    "runtime"
 )
 
-// Структура для информации о пагинации
-type Pagination struct {
-	Total   int `json:"total"`
-	Pages   int `json:"pages"`
-	Current int `json:"current"`
-	Limit   int `json:"limit"`
+const (
+    BaseURL = "https://loverepublic.ru"
+    APIEndpoint = BaseURL + "/api/catalog"
+    ProductsPerPage = 12
+    RequestTimeout = 30 * time.Second
+    DelayBetweenRequests = 1 * time.Second
+    OutputFileName = "loverepublic_products.json"
+)
+
+// Структуры для JSON
+type CategoryResponse struct {
+    Status int `json:"status"`
+    Data struct {
+        Variables struct {
+            SectionId   int    `json:"sectionId"`
+            SectionCode string `json:"sectionCode"` 
+            SectionName string `json:"sectionName"`
+        } `json:"variables"`
+    } `json:"data"`
 }
 
-// Структура для цвета
+type ProductsResponse struct {
+    Status int `json:"status"`
+    Data struct {
+        Items []Product `json:"items"`
+        Pagination struct {
+            Total  int `json:"total"`
+            Pages  int `json:"pages"`
+            Limit  int `json:"limit"`
+        } `json:"pagination"`
+    } `json:"data"`
+}
+
+type Product struct {
+    ID          int     `json:"id"`
+    Name        string  `json:"name"`
+    Article     string  `json:"article"`
+    Description string  `json:"description"`
+    Color       Color   `json:"color"`
+    Price       Price   `json:"price"`
+    SKU         []SKU   `json:"sku"`
+    Images      Images  `json:"images"`
+}
+
 type Color struct {
-	Color       string `json:"color"`
-	ColorName   string `json:"colorName"`
-	ColorCommon string `json:"colorCommon"`
-	ColorHex    string `json:"colorHex"`
+    ColorName   string `json:"colorName"`
+    ColorCommon string `json:"colorCommon"`
+    ColorHex    string `json:"colorHex"`
 }
 
-// Структура для свойств товара
-type Properties struct {
-	Stiker struct {
-		Code       string      `json:"code"`
-		Name       string      `json:"name"`
-		Value      int         `json:"value"`
-		CustomValue struct {
-			ID   int    `json:"id"`
-			Name string `json:"name"`
-		} `json:"customValue"`
-	} `json:"stiker"`
-	Stana struct {
-		Code string `json:"code"`
-		Name string `json:"name"`
-		Value string `json:"value"`
-	} `json:"strana"`
-	Cml2Sostav struct {
-		Code string `json:"code"`
-		Name string `json:"name"`
-		Value string `json:"value"`
-	} `json:"cml2Sostav"`
-	Cml2Uhod struct {
-		Code string `json:"code"`
-		Name string `json:"name"`
-		Value string `json:"value"`
-	} `json:"cml2Uhod"`
-	Season struct {
-		Code string `json:"code"`
-		Name string `json:"name"`
-		Value string `json:"value"`
-	} `json:"season"`
-	Preorder struct {
-		Code string `json:"code"`
-		Name string `json:"name"`
-		Value string `json:"value"`
-	} `json:"preorder"`
-	FitWith struct {
-		Code string   `json:"code"`
-		Name string   `json:"name"`
-		Value []int   `json:"value"`
-	} `json:"fitWith"`
-	Colors struct {
-		Code string `json:"code"`
-		Name string `json:"name"`
-		Value string `json:"value"`
-	} `json:"colors"`
-}
-
-// Структура для цены товара
 type Price struct {
-	Value             int    `json:"value"`
-	DiscountValue     int    `json:"discountValue"`
-	DiscountPercent   int    `json:"discountPercent"`
-	Currency          string `json:"currency"`
-	FormatValue       string `json:"formatValue"`
-	FormatDiscountValue string `json:"formatDiscountValue"`
-	AmountOfPayment   int    `json:"amountOfPayment"`
+    Value           int    `json:"value"`
+    DiscountValue   int    `json:"discountValue"`
+    DiscountPercent int    `json:"discountPercent"`
+    Currency        string `json:"currency"`
 }
 
-// Структура для склада
-type Stock struct {
-	StoreID  int `json:"storeId"`
-	Quantity int `json:"quantity"`
+type SKU struct {
+    ID       int    `json:"id"`
+    Size     string `json:"size"`
+    Quantity int    `json:"quantity"`
+    Stock    []struct {
+        StoreID  int `json:"storeId"`
+        Quantity int `json:"quantity"`
+    } `json:"stock"`
 }
 
-// Структура для SKU
-type Sku struct {
-	ID         int       `json:"id"`
-	Size       string    `json:"size"`
-	Color      Color     `json:"color"`
-	Ean        string    `json:"ean"`
-	Properties struct {
-		StarayaTsena struct {
-			Code string `json:"code"`
-			Name string `json:"name"`
-			Value string `json:"value"`
-		} `json:"starayaTsena"`
-	} `json:"properties"`
-	Quantity int      `json:"quantity"`
-	Stock    []Stock `json:"stock"`
-}
-
-// Структура для изображений
 type Images struct {
-	Thumb    []string `json:"thumb"`
-	List     []string `json:"list"`
-	Detail   []string `json:"detail"`
-	Original []string `json:"original"`
-	List150   []string `json:"list150"`
-	List375   []string `json:"list375"`
+    Original []string `json:"original"`
+    Detail   []string `json:"detail"`
 }
 
-// Структура для видео
-type Videos struct {
-	Order int    `json:"order"`
-	Xs    string `json:"xs"`
-	Sm    string `json:"sm"`
-	Md    string `json:"md"`
-	Lg    string `json:"lg"`
+// HTTP клиент с таймаутом
+var client = &http.Client{
+    Timeout: RequestTimeout,
 }
 
-// Структура для товара
-type Item struct {
-	ID              int          `json:"id"`
-	Name            string       `json:"name"`
-	DetailName      string       `json:"detailName"`
-	SectionId       int          `json:"sectionId"`
-	SectionName     string       `json:"sectionName"`
-	SectionPromoName string       `json:"sectionPromoName"`
-	Link            string       `json:"link"`
-	SectionLink     string       `json:"sectionLink"`
-	Description     string       `json:"description"`
-	Suite           struct {
-		PreviewPicture interface{} `json:"previewPicture"`
-		DetailPicture  interface{} `json:"detailPicture"`
-	} `json:"suite"`
-	Article  string     `json:"article"`
-	Meta     struct {
-		Title       string `json:"title"`
-		Keywords    string `json:"keywords"`
-		Description string `json:"description"`
-		H1          string `json:"h1"`
-	} `json:"meta"`
-	IsFullModel bool       `json:"isFullModel"`
-	Properties  Properties `json:"properties"`
-	Color       Color       `json:"color"`
-	Price       Price       `json:"price"`
-	IsAvailable bool       `json:"isAvailable"`
-	IsAvailableStores bool `json:"isAvailableStores"`
-	Sku         []Sku       `json:"sku"`
-	Images      Images      `json:"images"`
-	Videos      Videos      `json:"videos"`
-	Stores      []interface{} `json:"stores"`
+// Получение данных категории
+func getCategory(categoryURL string) (*CategoryResponse, error) {
+    url := fmt.Sprintf("%s?url=%s", APIEndpoint, categoryURL)
+    
+    resp, err := client.Get(url)
+    if err != nil {
+        return nil, fmt.Errorf("ошибка при запросе категории: %w", err)
+    }
+    defer resp.Body.Close()
+
+    var category CategoryResponse
+    if err := json.NewDecoder(resp.Body).Decode(&category); err != nil {
+        return nil, fmt.Errorf("ошибка при декодировании ответа категории: %w", err)
+    }
+
+    return &category, nil
 }
 
-type Breadcrumb struct {
-	Name string `json:"name"`
-	Url  string `json:"url"`
+// Получение списка продуктов
+func getProducts(sectionID int, page int) (*ProductsResponse, error) {
+    body := map[string]interface{}{
+        "uri":    fmt.Sprintf("/catalog/sections/%d/products/", sectionID),
+        "city":   "Москва",
+        "order":  "DESC",
+        "sort":   "SORT",
+        "offset": (page - 1) * ProductsPerPage,
+        "limit":  ProductsPerPage,
+    }
+    
+    jsonBody, err := json.Marshal(body)
+    if err != nil {
+        return nil, fmt.Errorf("ошибка при создании тела запроса: %w", err)
+    }
+
+    req, err := http.NewRequest("POST", APIEndpoint, bytes.NewBuffer(jsonBody))
+    if err != nil {
+        return nil, fmt.Errorf("ошибка при создании запроса: %w", err)
+    }
+    
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := client.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("ошибка при выполнении запроса: %w", err)
+    }
+    defer resp.Body.Close()
+
+    var products ProductsResponse
+    if err := json.NewDecoder(resp.Body).Decode(&products); err != nil {
+        return nil, fmt.Errorf("ошибка при декодировании ответа продуктов: %w", err)
+    }
+
+    return &products, nil
 }
 
-// Структура для полного ответа getProductsInCategory
-type GetProductsResponse struct {
-	Status   int           `json:"status"`
-	Data     ProductsData  `json:"data"` // Объект, а не массив
-	Errors   []interface{} `json:"errors"`
-	Messages []interface{} `json:"messages"`
+// Очистка описания продукта
+func cleanDescription(desc string) string {
+    desc = html.UnescapeString(desc)
+    
+    // Удаляем HTML-теги и заменяем переносы строк
+    replacements := map[string]string{
+        "<ul>": "",
+        "</ul>": "",
+        "<li>": "",
+        "</li>": " ",
+        "\\n": " ",
+        "\\r": " ",
+        "\n": " ",
+        "\r": " ",
+    }
+    
+    for old, new := range replacements {
+        desc = strings.ReplaceAll(desc, old, new)
+    }
+    
+    // Нормализация пробелов
+    for strings.Contains(desc, "  ") {
+        desc = strings.ReplaceAll(desc, "  ", " ")
+    }
+    
+    return strings.TrimSpace(desc)
 }
 
-type ProductsData struct {
-	Items      []Item      `json:"items"`
-	Pagination Pagination `json:"pagination"`
-}
+// Подготовка файла для записи
+func prepareOutputFile() (*os.File, error) {
+    // Удаляем старый файл если существует
+    if _, err := os.Stat(OutputFileName); err == nil {
+        if err := os.Remove(OutputFileName); err != nil {
+            return nil, fmt.Errorf("ошибка при удалении старого файла: %w", err)
+        }
+        fmt.Println("Старый файл удален")
+    }
 
-// Структура для полного ответа getProductDetails
-type GetProductDetailsResponse struct {
-	ID              int          `json:"id"`
-	Name            string       `json:"name"`
-	DetailName      string       `json:"detailName"`
-	SectionId       int          `json:"sectionId"`
-	SectionName     string       `json:"sectionName"`
-	SectionPromoName string       `json:"sectionPromoName"`
-	Breadcrumbs     []Breadcrumb `json:"breadcrumbs"`
-	Link            string       `json:"link"`
-	SectionLink     string       `json:"sectionLink"`
-	Description     string       `json:"description"`
-	Suite           struct {
-		PreviewPicture interface{} `json:"previewPicture"`
-		DetailPicture  interface{} `json:"detailPicture"`
-	} `json:"suite"`
-	Article  string     `json:"article"`
-	Meta     struct {
-		Title       string `json:"title"`
-		Keywords    string `json:"keywords"`
-		Description string `json:"description"`
-		H1          string `json:"h1"`
-	} `json:"meta"`
-	IsFullModel bool       `json:"isFullModel"`
-	Properties  Properties `json:"properties"`
-	Color       Color       `json:"color"`
-	Price       Price       `json:"price"`
-	IsAvailable bool       `json:"isAvailable"`
-	IsAvailableStores bool `json:"isAvailableStores"`
-	Sku         []Sku       `json:"sku"`
-	Images      Images      `json:"images"`
-	Videos      Videos      `json:"videos"`
-	Stores      []interface{} `json:"stores"`
-}
+    file, err := os.Create(OutputFileName)
+    if err != nil {
+        return nil, fmt.Errorf("ошибка при создании файла: %w", err)
+    }
 
-// Функция для получения списка товаров из категории
-func getProductsInCategory(sectionID int, offset int, limit int, city string) (*ProductsData, error) {
-	values := url.Values{}
-	values.Add("url", fmt.Sprintf("/catalog/sections/%d/products/", sectionID)) // Исправлено: "uri" -> "url"
-	values.Add("city", city)
-	values.Add("order", "DESC")
-	values.Add("sort", "SORT")
-	values.Add("offset", strconv.Itoa(offset))
-	values.Add("limit", strconv.Itoa(limit))
-
-	url := fmt.Sprintf("https://loverepublic.ru/api/catalog?%s", values.Encode())
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status code %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var response GetProductsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
-	}
-
-	if response.Status != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status code %d", response.Status)
-	}
-
-	return &response.Data, nil
-}
-
-// Функция для получения информации о товаре
-func getProductDetails(itemID int) (*GetProductDetailsResponse, error) {
-	url := fmt.Sprintf("https://loverepublic.ru/api/catalog/%d", itemID)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status code %d", resp.StatusCode)
-	}
-
-	var response GetProductDetailsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
-	}
-
-	return &response, nil
+    return file, nil
 }
 
 func main() {
-	sectionID := 68
-	offset := 0
-	limit := 12
-	city := "Пермь"
+    // Подготовка файла
+    file, err := prepareOutputFile()
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer file.Close()
 
-	productsData, err := getProductsInCategory(sectionID, offset, limit, city)
-	if err != nil {
-		log.Fatal(err)
-	}
+    // Получение данных категории
+    category, err := getCategory(BaseURL + "/catalog/odezhda/")
+    if err != nil {
+        log.Fatal(err)
+    }
 
-	if productsData != nil {
-		fmt.Printf("Total products: %d, Pages: %d\n", productsData.Pagination.Total, productsData.Pagination.Pages)
+    // Получение первой страницы для определения общего количества
+    firstPage, err := getProducts(category.Data.Variables.SectionId, 1)
+    if err != nil {
+        log.Fatal(err)
+    }
 
-		var wg sync.WaitGroup
-		for _, item := range productsData.Items {
-			wg.Add(1)
-			go func(item Item) {
-				defer wg.Done()
-				details, err := getProductDetails(item.ID)
-				if err != nil {
-					fmt.Printf("Error getting details for product %d: %v\n", item.ID, err)
-					return
-				}
-				fmt.Printf("Product ID: %d, Name: %s, Details: %+v\n", item.ID, item.Name, details)
-			}(item)
-		}
-		wg.Wait()
-	} else {
-		fmt.Println("No products found.")
-	}
+    totalPages := firstPage.Data.Pagination.Pages
+    totalProducts := 0
+
+    // Запись начала JSON массива
+    file.WriteString("[\n")
+
+    // Обработка всех страниц
+    for page := 1; page <= totalPages; page++ {
+        products, err := getProducts(category.Data.Variables.SectionId, page)
+        if err != nil {
+            log.Printf("Ошибка при получении страницы %d: %v", page, err)
+            continue
+        }
+
+        // Очистка описаний
+        for i := range products.Data.Items {
+            products.Data.Items[i].Description = cleanDescription(products.Data.Items[i].Description)
+        }
+
+        // Запись в файл
+        jsonData, err := json.MarshalIndent(products.Data.Items, "    ", "    ")
+        if err != nil {
+            log.Printf("Ошибка при маршалинге JSON для страницы %d: %v", page, err)
+            continue
+        }
+
+        if page > 1 {
+            file.WriteString(",\n")
+        }
+        file.Write(jsonData[1:len(jsonData)-1])
+
+        totalProducts += len(products.Data.Items)
+        fmt.Printf("Обработана страница %d из %d (всего товаров: %d)\n", 
+            page, totalPages, totalProducts)
+
+        // Очистка памяти
+        products = nil
+        jsonData = nil
+        runtime.GC()
+
+        time.Sleep(DelayBetweenRequests)
+    }
+
+    // Закрытие JSON массива
+    file.WriteString("\n]")
+
+    fmt.Printf("Парсинг завершен. Сохранено %d товаров в %s\n", 
+        totalProducts, OutputFileName)
 }
